@@ -330,7 +330,7 @@ const AP_Param::GroupInfo QuadPlane::var_info[] = {
     // @Param: OPTIONS
     // @DisplayName: quadplane options
     // @Description: Level Transition:Keep wings within LEVEL_ROLL_LIMIT and only use forward motor(s) for climb during transition, Allow FW Takeoff: If bit is not set then NAV_TAKEOFF command on quadplanes will instead perform a NAV_VTOL takeoff, Allow FW Land:If bit is not set then NAV_LAND command on quadplanes will instead perform a NAV_VTOL_LAND, Vtol Takeoff Frame: command NAV_VTOL_TAKEOFF altitude is as set by the command's reference frame rather than a delta above current location, Use FW Approach:Use a fixed wing approach for VTOL landings, USE QRTL:instead of QLAND for rc failsafe when in VTOL modes, Use Governor:Use ICE Idle Governor in MANUAL for forward motor, Force Qassist: on always,Mtrs_Only_Qassist: in tailsitters only, uses VTOL motors and not flying surfaces for QASSIST, Airmode_On_Arm:Airmode enabled when arming by aux switch, Disarmed Yaw Tilt:Enable motor tilt for yaw when disarmed, Delay Spoolup:Delay VTOL spoolup for 2 seconds after arming.
-    // @Bitmask: 0:Level Transition,1:Allow FW Takeoff,2:Allow FW Land,3:Vtol Takeoff Frame,4:Use FW Approach,5:Use QRTL,6:Use Governor,7:Force Qassist,8:Mtrs_Only_Qassist,9:Airmode_On_Arm,10:Disarmed Yaw Tilt,11:Delay Spoolup,12:disable Qassist based on synthetic airspeed,13:Disable Ground Effect Compensation
+    // @Bitmask: 0:Level Transition,1:Allow FW Takeoff,2:Allow FW Land,3:Vtol Takeoff Frame,4:Use FW Approach,5:Use QRTL,6:Use Governor,7:Force Qassist,8:Mtrs_Only_Qassist,9:Airmode_On_Arm,10:Disarmed Yaw Tilt,11:Delay Spoolup,12:disable Qassist based on synthetic airspeed,13:Disable Ground Effect Compensation,14:Ignore forward flight angle limits in Qmodes
     AP_GROUPINFO("OPTIONS", 58, QuadPlane, options, 0),
 
     AP_SUBGROUPEXTENSION("",59, QuadPlane, var_info2),
@@ -544,6 +544,8 @@ static const struct AP_Param::defaults_table_struct defaults_table[] = {
     { "Q_LOIT_BRK_ACCEL", 50.0 },
     { "Q_LOIT_BRK_JERK",  250 },
     { "Q_LOIT_SPEED",     500 },
+    { "Q_WP_SPEED",       500 },
+    { "Q_WP_ACCEL",       100 },
 };
 
 /*
@@ -624,7 +626,6 @@ bool QuadPlane::setup(void)
     }
     float loop_delta_t = 1.0 / plane.scheduler.get_loop_rate_hz();
 
-    enum AP_Motors::motor_frame_class motor_class;
     enum Rotation rotation = ROTATION_NONE;
 
     /*
@@ -654,8 +655,6 @@ bool QuadPlane::setup(void)
         }
         frame_class.set_and_save(new_value);
     }
-    gcs().send_text(MAV_SEVERITY_INFO, "QuadPlane initialise, class: %u, type: %u", 
-                    (unsigned)frame_class.get(), (unsigned)frame_type.get());
     
     if (hal.util->available_memory() <
         4096 + sizeof(*motors) + sizeof(*attitude_control) + sizeof(*pos_control) + sizeof(*wp_nav) + sizeof(*ahrs_view) + sizeof(*loiter_nav)) {
@@ -667,8 +666,7 @@ bool QuadPlane::setup(void)
       that the objects don't affect the vehicle unless enabled and
       also saves memory when not in use
      */
-    motor_class = (enum AP_Motors::motor_frame_class)frame_class.get();
-    switch (motor_class) {
+    switch ((AP_Motors::motor_frame_class)frame_class) {
     case AP_Motors::MOTOR_FRAME_QUAD:
         setup_default_channels(4);
         break;
@@ -692,12 +690,13 @@ bool QuadPlane::setup(void)
     case AP_Motors::MOTOR_FRAME_TAILSITTER:
         break;
     default:
-        AP_BoardConfig::config_error("Unknown Q_FRAME_CLASS %u", (unsigned)frame_class.get());
+        AP_BoardConfig::config_error("Unsupported Q_FRAME_CLASS %u", frame_class);
     }
+    ::printf("QuadPlane initialise, class: %u, type: %u\n", frame_class.get(), frame_type.get());
 
     if (tailsitter.motor_mask == 0) {
         // this is a normal quadplane
-        switch (motor_class) {
+        switch ((AP_Motors::motor_frame_class)frame_class) {
         case AP_Motors::MOTOR_FRAME_TRI:
             motors = new AP_MotorsTri(plane.scheduler.get_loop_rate_hz(), rc_speed);
             motors_var_info = AP_MotorsTri::var_info;
@@ -719,7 +718,7 @@ bool QuadPlane::setup(void)
         // this is a copter tailsitter with motor layout specified by frame_class and frame_type
         // tilting motors are not supported (tiltrotor control variables are ignored)
         if (tilt.tilt_mask != 0) {
-            gcs().send_text(MAV_SEVERITY_INFO, "Warning: Motor tilt not supported");
+            ::printf("Warning: Motor tilt not supported\n");
         }
         rotation = ROTATION_PITCH_90;
         motors = new AP_MotorsMatrix(plane.scheduler.get_loop_rate_hz(), rc_speed);
@@ -761,10 +760,10 @@ bool QuadPlane::setup(void)
     }
     AP_Param::load_object_from_eeprom(loiter_nav, loiter_nav->var_info);
 
-    motors->init((AP_Motors::motor_frame_class)frame_class.get(), (AP_Motors::motor_frame_type)frame_type.get());
+    motors->init(frame_class, frame_type);
 
     if (!motors->initialised_ok()) {
-        AP_BoardConfig::config_error("unknown Q_FRAME_TYPE %u", (unsigned)frame_type.get());
+        AP_BoardConfig::config_error("init failed: Q_FRAME_CLASS=%u Q_FRAME_TYPE=%u", frame_class, frame_type);
     }
 
     tilt.is_vectored = tilt.tilt_mask != 0 && tilt.tilt_type == TILT_TYPE_VECTORED_YAW;
@@ -783,7 +782,7 @@ bool QuadPlane::setup(void)
 
     // TODO: update this if servo function assignments change
     // used by relax_attitude_control() to control special behavior for vectored tailsitters
-    _is_vectored = (motor_class == AP_Motors::MOTOR_FRAME_TAILSITTER) &&
+    _is_vectored = (frame_class == AP_Motors::MOTOR_FRAME_TAILSITTER) &&
                    (!is_zero(tailsitter.vectored_hover_gain) &&
                     (SRV_Channels::function_assigned(SRV_Channel::k_tiltMotorLeft) ||
                      SRV_Channels::function_assigned(SRV_Channel::k_tiltMotorRight)));
@@ -822,7 +821,7 @@ bool QuadPlane::setup(void)
     // param count will have changed
     AP_Param::invalidate_count();
 
-    gcs().send_text(MAV_SEVERITY_INFO, "QuadPlane initialised");
+    ::printf("QuadPlane initialised, class: %s, type: %s\n", motors->get_frame_string(), motors->get_type_string());
     initialised = true;
     return true;
 }
@@ -834,9 +833,7 @@ void QuadPlane::setup_defaults(void)
 {
     AP_Param::set_defaults_from_table(defaults_table, ARRAY_SIZE(defaults_table));
 
-    enum AP_Motors::motor_frame_class motor_class;
-    motor_class = (enum AP_Motors::motor_frame_class)frame_class.get();
-    if (motor_class == AP_Motors::MOTOR_FRAME_TAILSITTER) {
+    if (frame_class == AP_Motors::MOTOR_FRAME_TAILSITTER) {
         AP_Param::set_defaults_from_table(defaults_table_tailsitter, ARRAY_SIZE(defaults_table_tailsitter));
     }
     
@@ -904,11 +901,11 @@ void QuadPlane::update_yaw_target(void)
      */
     float aspeed;
     bool have_airspeed = ahrs.airspeed_estimate(aspeed);
-    if (have_airspeed) {
+    if (have_airspeed && labs(plane.nav_roll_cd)>1000) {
         float dt = (now - tilt.transition_yaw_set_ms) * 0.001;
         // calculate the yaw rate to achieve the desired turn rate
         const float airspeed_min = MAX(plane.aparm.airspeed_min,5);
-        const float yaw_rate_cds = degrees(GRAVITY_MSS/MAX(aspeed,airspeed_min) * sinf(radians(plane.nav_roll_cd*0.01)))*100;
+        const float yaw_rate_cds = fixedwing_turn_rate(plane.nav_roll_cd*0.01, MAX(aspeed,airspeed_min))*100;
         tilt.transition_yaw_cd += yaw_rate_cds * dt;
     }
     tilt.transition_yaw_set_ms = now;
@@ -1826,11 +1823,13 @@ void QuadPlane::update_transition(void)
         }
         assisted_flight = true;
 
-        // do not allow a climb on the quad motors during transition
-        // a climb would add load to the airframe, and prolongs the
-        // transition
+        // do not allow a climb on the quad motors during transition a
+        // climb would add load to the airframe, and prolongs the
+        // transition. We don't limit the climb rate on tilt rotors as
+        // otherwise the plane can end up in high-alpha flight with
+        // low VTOL thrust and may not complete a transition
         float climb_rate_cms = assist_climb_rate_cms();
-        if (options & OPTION_LEVEL_TRANSITION) {
+        if ((options & OPTION_LEVEL_TRANSITION) && tilt.tilt_mask == 0) {
             climb_rate_cms = MIN(climb_rate_cms, 0.0f);
         }
         hold_hover(climb_rate_cms);
@@ -2328,7 +2327,7 @@ bool QuadPlane::init_mode(void)
 /*
   handle a MAVLink DO_VTOL_TRANSITION
  */
-bool QuadPlane::handle_do_vtol_transition(enum MAV_VTOL_STATE state)
+bool QuadPlane::handle_do_vtol_transition(enum MAV_VTOL_STATE state) const
 {
     if (!available()) {
         gcs().send_text(MAV_SEVERITY_NOTICE, "VTOL not available");
@@ -3212,8 +3211,9 @@ int8_t QuadPlane::forward_throttle_pct()
         // lidar could cause the aircraft not to be able to
         // approach the landing point when landing below the takeoff point
         vel_forward.last_pct = vel_forward.integrator;
-    } else if (in_vtol_land_final() && motors->limit.throttle_lower) {
-        // we're in the settling phase of landing, disable fwd motor
+    } else if ((in_vtol_land_final() && motors->limit.throttle_lower) ||
+              (plane.g.rangefinder_landing && (plane.rangefinder.status_orient(ROTATION_PITCH_270) == RangeFinder::Status::OutOfRangeLow))) {
+        // we're in the settling phase of landing or using a rangefinder that is out of range low, disable fwd motor
         vel_forward.last_pct = 0;
         vel_forward.integrator = 0;
     } else {

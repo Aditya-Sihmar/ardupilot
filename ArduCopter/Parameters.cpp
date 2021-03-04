@@ -864,7 +864,7 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     // @Param: FRAME_CLASS
     // @DisplayName: Frame Class
     // @Description: Controls major frame class for multicopter component
-    // @Values: 0:Undefined, 1:Quad, 2:Hexa, 3:Octa, 4:OctaQuad, 5:Y6, 6:Heli, 7:Tri, 8:SingleCopter, 9:CoaxCopter, 10:BiCopter, 11:Heli_Dual, 12:DodecaHexa, 13:HeliQuad, 14:Deca, 15:Scripting Matrix
+    // @Values: 0:Undefined, 1:Quad, 2:Hexa, 3:Octa, 4:OctaQuad, 5:Y6, 6:Heli, 7:Tri, 8:SingleCopter, 9:CoaxCopter, 10:BiCopter, 11:Heli_Dual, 12:DodecaHexa, 13:HeliQuad, 14:Deca, 15:Scripting Matrix, 16:6DoF Scripting
     // @User: Standard
     // @RebootRequired: True
     AP_GROUPINFO("FRAME_CLASS", 15, ParametersG2, frame_class, DEFAULT_FRAME_CLASS),
@@ -1044,6 +1044,13 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("RTL_OPTIONS", 43, ParametersG2, rtl_options, 0),
 #endif
+
+    // @Param: FLIGHT_OPTIONS
+    // @DisplayName: Flight mode options
+    // @Description: Flight mode specific options
+    // @Bitmask: 0:Disable thrust loss check, 1:Disable yaw imbalance warning
+    // @User: Advanced
+    AP_GROUPINFO("FLIGHT_OPTIONS", 44, ParametersG2, flight_options, 0),
 
     AP_GROUPEND
 };
@@ -1411,7 +1418,7 @@ void Copter::convert_lgr_parameters(void)
 
 #if FRAME_CONFIG == HELI_FRAME
 // handle conversion of tradheli parameters from Copter-3.6 to Copter-3.7
-void Copter::convert_tradheli_parameters(void)
+void Copter::convert_tradheli_parameters(void) const
 {
     if (g2.frame_class.get() == AP_Motors::MOTOR_FRAME_HELI) {
         // single heli conversion info
@@ -1585,7 +1592,7 @@ void Copter::convert_tradheli_parameters(void)
 }
 #endif
 
-void Copter::convert_fs_options_params(void)
+void Copter::convert_fs_options_params(void) const
 {
     // If FS_OPTIONS has already been configured and we don't change it.
     enum ap_var_type ptype;

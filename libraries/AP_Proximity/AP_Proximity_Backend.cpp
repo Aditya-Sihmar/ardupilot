@@ -31,16 +31,21 @@ AP_Proximity_Backend::AP_Proximity_Backend(AP_Proximity &_frontend, AP_Proximity
 {
 }
 
+static_assert(PROXIMITY_MAX_DIRECTION <= 8,
+              "get_horizontal_distances assumes 8-bits is enough for validity bitmask");
+
 // get distances in PROXIMITY_MAX_DIRECTION directions horizontally. used for sending distances to ground station
 bool AP_Proximity_Backend::get_horizontal_distances(AP_Proximity::Proximity_Distance_Array &prx_dist_array) const
 {
     // cycle through all sectors filling in distances and orientations
     // see MAV_SENSOR_ORIENTATION for orientations (0 = forward, 1 = 45 degree clockwise from north, etc)
     bool valid_distances = false;
+    prx_dist_array.offset_valid = 0;
     for (uint8_t i=0; i<PROXIMITY_MAX_DIRECTION; i++) {
         prx_dist_array.orientation[i] = i;
         const AP_Proximity_Boundary_3D::Face face(PROXIMITY_MIDDLE_LAYER, i);
         if (boundary.get_distance(face, prx_dist_array.distance[i])) {
+            prx_dist_array.offset_valid |= (1U << i);
             valid_distances = true;
         } else {
             prx_dist_array.distance[i] = distance_max();
@@ -113,16 +118,16 @@ void AP_Proximity_Backend::database_push(float angle, float pitch, float distanc
     if (oaDb == nullptr || !oaDb->healthy()) {
         return;
     }
-    
+
     //Assume object is angle and pitch bearing and distance meters away from the vehicle 
     Vector3f object_3D;
-    object_3D.offset_bearing(wrap_180(angle), wrap_180(pitch), distance);	
+    object_3D.offset_bearing(wrap_180(angle), wrap_180(pitch * -1.0f), distance);
     const Vector3f rotated_object_3D = body_to_ned * object_3D;
-    
+
     //Calculate the position vector from origin
     Vector3f temp_pos = current_pos + rotated_object_3D;
     //Convert the vector to a NEU frame from NED
     temp_pos.z = temp_pos.z * -1.0f;
-    
+
     oaDb->queue_push(temp_pos, timestamp_ms, distance);
 }

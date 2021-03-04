@@ -29,6 +29,7 @@
 #include <AP_Airspeed/AP_Airspeed.h>
 #include <AP_Camera/AP_Camera.h>
 #include <AP_Gripper/AP_Gripper.h>
+#include <AC_Sprayer/AC_Sprayer.h>
 #include <AP_BLHeli/AP_BLHeli.h>
 #include <AP_RSSI/AP_RSSI.h>
 #include <AP_RTC/AP_RTC.h>
@@ -314,7 +315,7 @@ void GCS_MAVLINK::send_distance_sensor(const AP_RangeFinder_Backend *sensor, con
 // send any and all distance_sensor messages.  This starts by sending
 // any distance sensors not used by a Proximity sensor, then sends the
 // proximity sensor ones.
-void GCS_MAVLINK::send_distance_sensor() const
+void GCS_MAVLINK::send_distance_sensor()
 {
     RangeFinder *rangefinder = RangeFinder::get_singleton();
     if (rangefinder == nullptr) {
@@ -368,7 +369,7 @@ void GCS_MAVLINK::send_rangefinder() const
             s->voltage_mv() * 0.001f);
 }
 
-void GCS_MAVLINK::send_proximity() const
+void GCS_MAVLINK::send_proximity()
 {
     AP_Proximity *proximity = AP_Proximity::get_singleton();
     if (proximity == nullptr) {
@@ -386,6 +387,13 @@ void GCS_MAVLINK::send_proximity() const
             for (uint8_t i = 0; i < PROXIMITY_MAX_DIRECTION; i++) {
                 if (!HAVE_PAYLOAD_SPACE(chan, DISTANCE_SENSOR)) {
                     return;
+                }
+                if (dist_array.valid(i)) {
+                    proximity_ever_valid_bitmask |= (1U << i);
+                } else if (!(proximity_ever_valid_bitmask & (1U << i))) {
+                    // we've never sent this distance out, so we don't
+                    // need to send an invalid one.
+                    continue;
                 }
                 mavlink_msg_distance_sensor_send(
                         chan,
@@ -429,7 +437,8 @@ void GCS_MAVLINK::send_ahrs2()
     const AP_AHRS &ahrs = AP::ahrs();
     Vector3f euler;
     struct Location loc {};
-    if (ahrs.get_secondary_attitude(euler) ||
+    // we want one or both of these, use | to avoid short-circuiting:
+    if (ahrs.get_secondary_attitude(euler) |
         ahrs.get_secondary_position(loc)) {
         mavlink_msg_ahrs2_send(chan,
                                euler.x,
@@ -479,7 +488,7 @@ void GCS_MAVLINK::handle_mission_request_list(const mavlink_message_t &msg)
 /*
   handle a MISSION_REQUEST mavlink packet
  */
-void GCS_MAVLINK::handle_mission_request_int(const mavlink_message_t &msg)
+void GCS_MAVLINK::handle_mission_request_int(const mavlink_message_t &msg) const
 {
         // decode
         mavlink_mission_request_int_t packet;
@@ -492,7 +501,7 @@ void GCS_MAVLINK::handle_mission_request_int(const mavlink_message_t &msg)
         prot->handle_mission_request_int(*this, packet, msg);
 }
 
-void GCS_MAVLINK::handle_mission_request(const mavlink_message_t &msg)
+void GCS_MAVLINK::handle_mission_request(const mavlink_message_t &msg) const
 {
         // decode
         mavlink_mission_request_t packet;
@@ -507,6 +516,12 @@ void GCS_MAVLINK::handle_mission_request(const mavlink_message_t &msg)
 
 /*
   handle a MISSION_SET_CURRENT mavlink packet
+
+  Note that there exists a relatively new mavlink DO command,
+  MAV_CMD_DO_SET_MISSION_CURRENT which provides an acknowledgement
+  that the command has been received, rather than the GCS having to
+  rely on getting back an identical sequence number as some currently
+  do.
  */
 void GCS_MAVLINK::handle_mission_set_current(AP_Mission &mission, const mavlink_message_t &msg)
 {
@@ -516,7 +531,20 @@ void GCS_MAVLINK::handle_mission_set_current(AP_Mission &mission, const mavlink_
 
     // set current command
     if (mission.set_current_cmd(packet.seq)) {
-        mavlink_msg_mission_current_send(chan, packet.seq);
+        // because MISSION_SET_CURRENT is a message not a command,
+        // there is not ACK associated with us successfully changing
+        // our waypoint.  Some GCSs use the fact we return exactly the
+        // same mission sequence number in this packet as an ACK - so
+        // if they send a MISSION_SET_CURRENT with seq number of 4
+        // then they expect to receive a MISSION_CURRENT message with
+        // exactly that sequence number in it, even if ArduPilot never
+        // actually holds that as a sequence number (e.g. packet.seq==0).
+        if (HAVE_PAYLOAD_SPACE(chan, MISSION_CURRENT)) {
+            mavlink_msg_mission_current_send(chan, packet.seq);
+        } else {
+            // schedule it for later:
+            send_message(MSG_CURRENT_WAYPOINT);
+        }
     }
 }
 
@@ -545,7 +573,7 @@ void GCS_MAVLINK::handle_mission_count(const mavlink_message_t &msg)
 /*
   handle a MISSION_CLEAR_ALL mavlink packet
  */
-void GCS_MAVLINK::handle_mission_clear_all(const mavlink_message_t &msg)
+void GCS_MAVLINK::handle_mission_clear_all(const mavlink_message_t &msg) const
 {
     // decode
     mavlink_mission_clear_all_t packet;
@@ -2865,7 +2893,7 @@ void GCS_MAVLINK::send_timesync()
         );
 }
 
-void GCS_MAVLINK::handle_statustext(const mavlink_message_t &msg)
+void GCS_MAVLINK::handle_statustext(const mavlink_message_t &msg) const
 {
     AP_Logger *logger = AP_Logger::get_singleton();
     if (logger == nullptr) {
@@ -3232,7 +3260,7 @@ void GCS_MAVLINK::handle_obstacle_distance_3d(const mavlink_message_t &msg)
     }
 }
 
-void GCS_MAVLINK::handle_osd_param_config(const mavlink_message_t &msg)
+void GCS_MAVLINK::handle_osd_param_config(const mavlink_message_t &msg) const
 {
 #if OSD_PARAM_ENABLED
     AP_OSD *osd = AP::osd();
@@ -3670,7 +3698,25 @@ MAV_RESULT GCS_MAVLINK::_handle_command_preflight_calibration(const mavlink_comm
         return AP::ins().simple_accel_cal();
     }
 
-    return MAV_RESULT_UNSUPPORTED;
+    /*
+      allow GCS to force an existing calibration of accel and/or
+      compass to be written as valid. This is useful when reloading
+      parameters after a full parameter erase
+     */
+    MAV_RESULT ret = MAV_RESULT_UNSUPPORTED;
+    if (is_equal(packet.param5,76.0f)) {
+        // force existing accel calibration to be accepted as valid
+        AP::ins().force_save_calibration();
+        ret = MAV_RESULT_ACCEPTED;
+    }
+
+    if (is_equal(packet.param2,76.0f)) {
+        // force existing compass calibration to be accepted as valid
+        AP::compass().force_save_calibration();
+        ret = MAV_RESULT_ACCEPTED;
+    }
+    
+    return ret;
 }
 
 MAV_RESULT GCS_MAVLINK::handle_command_preflight_calibration(const mavlink_command_long_t &packet)
@@ -3692,7 +3738,7 @@ MAV_RESULT GCS_MAVLINK::handle_command_preflight_can(const mavlink_command_long_
         return MAV_RESULT_TEMPORARILY_REJECTED;
     }
 
-    bool start_stop = is_equal(packet.param1,1.0f) ? true : false;
+    bool start_stop = is_equal(packet.param1,1.0f);
     bool result = true;
     bool can_exists = false;
     uint8_t num_drivers = AP::can().get_num_drivers();
@@ -3746,6 +3792,29 @@ MAV_RESULT GCS_MAVLINK::handle_command_preflight_can(const mavlink_command_long_
 #else
     return MAV_RESULT_UNSUPPORTED;
 #endif
+}
+
+// changes the current waypoint; at time of writing GCS
+// implementations use the mavlink message MISSION_SET_CURRENT to set
+// the current waypoint, rather than this DO command.  It is hoped we
+// can move to this command in the future to avoid acknowledgement
+// issues with MISSION_SET_CURRENT
+MAV_RESULT GCS_MAVLINK::handle_command_do_set_mission_current(const mavlink_command_long_t &packet)
+{
+    AP_Mission *mission = AP::mission();
+    if (mission == nullptr) {
+        return MAV_RESULT_UNSUPPORTED;
+    }
+
+    const uint32_t seq = (uint32_t)packet.param1;
+    if (!mission->set_current_cmd(seq)) {
+        return MAV_RESULT_FAILED;
+    }
+
+    // volunteer the new current waypoint for all listeners
+    send_message(MSG_CURRENT_WAYPOINT);
+
+    return MAV_RESULT_ACCEPTED;
 }
 
 MAV_RESULT GCS_MAVLINK::handle_command_battery_reset(const mavlink_command_long_t &packet)
@@ -3847,6 +3916,24 @@ MAV_RESULT GCS_MAVLINK::handle_command_do_gripper(const mavlink_command_long_t &
 
     return result;
 }
+
+#if HAL_SPRAYER_ENABLED
+MAV_RESULT GCS_MAVLINK::handle_command_do_sprayer(const mavlink_command_long_t &packet)
+{
+    AC_Sprayer *sprayer = AP::sprayer();
+    if (sprayer == nullptr) {
+        return MAV_RESULT_FAILED;
+    }
+
+    if (is_equal(packet.param1, 1.0f)) {
+        sprayer->run(true);
+    } else if (is_zero(packet.param1)) {
+        sprayer->run(false);
+    }
+
+    return MAV_RESULT_ACCEPTED;
+}
+#endif
 
 MAV_RESULT GCS_MAVLINK::handle_command_accelcal_vehicle_pos(const mavlink_command_long_t &packet)
 {
@@ -3973,6 +4060,12 @@ MAV_RESULT GCS_MAVLINK::handle_command_long_packet(const mavlink_command_long_t 
         result = handle_command_do_gripper(packet);
         break;
 
+#if HAL_SPRAYER_ENABLED
+    case MAV_CMD_DO_SPRAYER:
+        result = handle_command_do_sprayer(packet);
+        break;
+#endif
+
     case MAV_CMD_DO_MOUNT_CONFIGURE:
     case MAV_CMD_DO_MOUNT_CONTROL:
         result = handle_command_mount(packet);
@@ -3993,6 +4086,11 @@ MAV_RESULT GCS_MAVLINK::handle_command_long_packet(const mavlink_command_long_t 
 
     case MAV_CMD_PREFLIGHT_CALIBRATION:
         result = handle_command_preflight_calibration(packet);
+        break;
+
+
+    case MAV_CMD_DO_SET_MISSION_CURRENT:
+        result = handle_command_do_set_mission_current(packet);
         break;
 
     case MAV_CMD_BATTERY_RESET:
@@ -4296,7 +4394,7 @@ void GCS_MAVLINK::handle_command_int(const mavlink_message_t &msg)
     hal.util->persistent_data.last_mavlink_cmd = 0;
 }
 
-void GCS::try_send_queued_message_for_type(MAV_MISSION_TYPE type) {
+void GCS::try_send_queued_message_for_type(MAV_MISSION_TYPE type) const {
     MissionItemProtocol *prot = get_prot_for_mission_type(type);
     if (prot == nullptr) {
         return;
@@ -4999,7 +5097,7 @@ uint32_t GCS_MAVLINK::correct_offboard_timestamp_usec_to_ms(uint64_t offboard_us
   return true if we will accept this packet. Used to implement SYSID_ENFORCE
  */
 bool GCS_MAVLINK::accept_packet(const mavlink_status_t &status,
-                                const mavlink_message_t &msg)
+                                const mavlink_message_t &msg) const
 {
     if (msg.sysid == mavlink_system.sysid) {
         // accept packets from our own components

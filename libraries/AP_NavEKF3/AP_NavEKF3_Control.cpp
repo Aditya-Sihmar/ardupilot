@@ -90,11 +90,7 @@ void NavEKF3_core::setWindMagStateLearningMode()
     }
 
     // determine if the vehicle is manoeuvring
-    if (accNavMagHoriz > 0.5f) {
-        manoeuvring = true;
-    } else {
-        manoeuvring = false;
-    }
+    manoeuvring = accNavMagHoriz > 0.5f;
 
     // Determine if learning of magnetic field states has been requested by the user
     bool magCalRequested =
@@ -537,16 +533,16 @@ bool NavEKF3_core::use_compass(void) const
 // are we using a yaw source other than the magnetomer?
 bool NavEKF3_core::using_external_yaw(void) const
 {
-#if EK3_FEATURE_EXTERNAL_NAV
     const AP_NavEKF_Source::SourceYaw yaw_source = frontend->sources.getYawSource();
-    if (yaw_source == AP_NavEKF_Source::SourceYaw::GPS || yaw_source == AP_NavEKF_Source::SourceYaw::GPS_COMPASS_FALLBACK ||
-        yaw_source == AP_NavEKF_Source::SourceYaw::GSF || !use_compass()) {
-        return imuSampleTime_ms - last_gps_yaw_fusion_ms < 5000 || imuSampleTime_ms - lastSynthYawTime_ms < 5000;
-    }
+#if EK3_FEATURE_EXTERNAL_NAV
     if (yaw_source == AP_NavEKF_Source::SourceYaw::EXTNAV) {
         return ((imuSampleTime_ms - last_extnav_yaw_fusion_ms < 5000) || (imuSampleTime_ms - lastSynthYawTime_ms < 5000));
     }
 #endif
+    if (yaw_source == AP_NavEKF_Source::SourceYaw::GPS || yaw_source == AP_NavEKF_Source::SourceYaw::GPS_COMPASS_FALLBACK ||
+        yaw_source == AP_NavEKF_Source::SourceYaw::GSF || !use_compass()) {
+        return imuSampleTime_ms - last_gps_yaw_fusion_ms < 5000 || imuSampleTime_ms - lastSynthYawTime_ms < 5000;
+    }
     return false;
 }
 
